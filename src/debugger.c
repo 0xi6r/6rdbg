@@ -1,263 +1,292 @@
 #include "debugger.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <tlhelp32.h>
-#include <psapi.h>
-#include <dbghelp.h>
 
-#pragma comment(lib, "dbghelp.lib")
-#pragma comment(lib, "psapi.lib")
-#pragma comment(lib, "kernel32.lib")
+// Forward declarations
+static bool handle_debug_event(Debugger* dbg, DEBUG_EVENT* evt);
+static bool set_software_breakpoint(Debugger* dbg, uintptr_t addr);
+static bool remove_software_breakpoint(Debugger* dbg, uintptr_t addr, BYTE original_byte);
 
-DebuggerSession g_debugger = {0};
-
-/* Initialize debugger subsystems */
-BOOL InitializeDebugger(void) {
-    memset(&g_debugger, 0, sizeof(DebuggerSession));
+bool dbg_initialize(Debugger* dbg, const char* exe_path) {
+    ZeroMemory(dbg, sizeof(Debugger));
     
-    // Initialize symbol handler
-    SymInitialize(GetCurrentProcess(), NULL, FALSE);
-    
-    // Create debug event
-    g_debugger.hDebugEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
-    
-    return TRUE;
-}
-
-/* Attach to and debug a process */
-BOOL AttachToProcess(const char* exePath) {
-    STARTUPINFOA si = {0};
+    // Create suspended process for debugging
+    STARTUPINFO si = {0};
     PROCESS_INFORMATION pi = {0};
-    DEBUG_EVENT dbgEvent = {0};
-    
     si.cb = sizeof(si);
     
-    // Create process in debug mode
-    if (!CreateProcessA(exePath, NULL, NULL, NULL, FALSE,
-                       DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS,
-                       NULL, NULL, &si, &pi)) {
-        fprintf(stderr, "CreateProcess failed: %lu\n", GetLastError());
-        return FALSE;
+    char cmd_line[MAX_PATH];
+    snprintf(cmd_line, sizeof(cmd_line), "\"%s\"", exe_path);
+    
+    if (!CreateProcessA(
+        NULL, 
+        cmd_line, 
+        NULL, 
+        NULL, 
+        FALSE, 
+        DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS | CREATE_SUSPENDED,
+        NULL, 
+        NULL, 
+        &si, 
+        &pi)) {
+        printf("CreateProcess failed (err=%lu)\n", GetLastError());
+        return false;
     }
     
-    g_debugger.hProcess = pi.hProcess;
-    g_debugger.dwProcessId = pi.dwProcessId;
+    dbg->hProcess = pi.hProcess;
+    dbg->hThread = pi.hThread;
+    dbg->pid = pi.dwProcessId;
+    dbg->tid = pi.dwThreadId;
+    dbg->is_running = false;
+    dbg->active_panel = PANEL_ASSEMBLY;
+    dbg->memory_base = 0x400000; // Default base address
     
-    // Load symbols
-    SymLoadModule64(g_debugger.hProcess, NULL, exePath, NULL, 0, 0);
-    
-    // Wait for initial debug event
-    if (!WaitForDebugEvent(&dbgEvent, INFINITE)) {
-        fprintf(stderr, "WaitForDebugEvent failed: %lu\n", GetLastError());
-        return FALSE;
+    // Initialize context
+    dbg->ctx.ContextFlags = CONTEXT_FULL;
+    if (!GetThreadContext(dbg->hThread, &dbg->ctx)) {
+        printf("GetThreadContext failed (err=%lu)\n", GetLastError());
+        TerminateProcess(dbg->hProcess, 1);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return false;
     }
     
-    if (dbgEvent.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
-        g_debugger.hThread = dbgEvent.u.CreateProcessInfo.hThread;
-        g_debugger.dwThreadId = dbgEvent.dwThreadId;
-        
-        printf("[*] Process created: PID=%lu, TID=%lu\n",
-               g_debugger.dwProcessId, g_debugger.dwThreadId);
-    }
-    
-    ContinueDebugEvent(dbgEvent.dwProcessId, dbgEvent.dwThreadId, DBG_CONTINUE);
-    g_debugger.state = DBG_STOPPED;
-    
-    return TRUE;
+    return true;
 }
 
-/* Set software breakpoint (INT3 - 0xCC) */
-BOOL SetBreakpoint(DWORD address) {
-    if (g_debugger.breakpointCount >= MAX_BREAKPOINTS) {
-        fprintf(stderr, "Maximum breakpoints reached\n");
-        return FALSE;
+void dbg_cleanup(Debugger* dbg) {
+    if (dbg->hThread) CloseHandle(dbg->hThread);
+    if (dbg->hProcess) {
+        // Remove all breakpoints before termination
+        for (int i = 0; i < dbg->breakpoint_count; i++) {
+            if (dbg->breakpoints[i].enabled) {
+                remove_software_breakpoint(dbg, dbg->breakpoints[i].address, 
+                                         dbg->breakpoints[i].original_byte);
+            }
+        }
+        TerminateProcess(dbg->hProcess, 0);
+        CloseHandle(dbg->hProcess);
+    }
+}
+
+bool dbg_run(Debugger* dbg) {
+    DEBUG_EVENT evt;
+    DWORD continue_status = DBG_CONTINUE;
+    
+    dbg->is_running = true;
+    
+    // Resume suspended thread
+    ResumeThread(dbg->hThread);
+    
+    while (dbg->is_running && !dbg->exit_debugger) {
+        if (!WaitForDebugEvent(&evt, 100)) {
+            if (GetLastError() == ERROR_SEM_TIMEOUT) {
+                continue; // No event yet
+            }
+            printf("WaitForDebugEvent failed (err=%lu)\n", GetLastError());
+            dbg->is_running = false;
+            return false;
+        }
+        
+        if (!handle_debug_event(dbg, &evt)) {
+            dbg->is_running = false;
+            return false;
+        }
+        
+        ContinueDebugEvent(evt.dwProcessId, evt.dwThreadId, continue_status);
     }
     
-    BYTE originalByte;
-    SIZE_T bytesRead;
+    SuspendThread(dbg->hThread); // Ensure thread is suspended when stopped
+    dbg_update_context(dbg);
+    return true;
+}
+
+bool dbg_continue(Debugger* dbg) {
+    // Remove single-step flag if set
+    dbg->ctx.EFlags &= ~0x100;
+    if (!SetThreadContext(dbg->hThread, &dbg->ctx)) {
+        printf("SetThreadContext failed (err=%lu)\n", GetLastError());
+        return false;
+    }
+    
+    return dbg_run(dbg);
+}
+
+bool dbg_step(Debugger* dbg) {
+    // Set trap flag for single-step
+    dbg->ctx.EFlags |= 0x100;
+    if (!SetThreadContext(dbg->hThread, &dbg->ctx)) {
+        printf("SetThreadContext failed (err=%lu)\n", GetLastError());
+        return false;
+    }
+    
+    return dbg_run(dbg);
+}
+
+bool dbg_set_breakpoint(Debugger* dbg, uintptr_t addr) {
+    if (dbg->breakpoint_count >= MAX_BREAKPOINTS) {
+        printf("Maximum breakpoints reached\n");
+        return false;
+    }
+    
+    // Check if breakpoint already exists
+    for (int i = 0; i < dbg->breakpoint_count; i++) {
+        if (dbg->breakpoints[i].address == addr) {
+            dbg->breakpoints[i].enabled = true;
+            return set_software_breakpoint(dbg, addr);
+        }
+    }
+    
+    // Create new breakpoint
+    Breakpoint* bp = &dbg->breakpoints[dbg->breakpoint_count];
+    bp->enabled = true;
+    bp->address = addr;
     
     // Read original byte
-    if (!ReadProcessMemory(g_debugger.hProcess, (LPVOID)(uintptr_t)address,
-                          &originalByte, 1, &bytesRead)) {
-        fprintf(stderr, "Failed to read memory at 0x%lx\n", address);
-        return FALSE;
+    if (!ReadProcessMemory(dbg->hProcess, (LPCVOID)addr, &bp->original_byte, 1, NULL)) {
+        printf("Failed to read memory at 0x%p (err=%lu)\n", (void*)addr, GetLastError());
+        return false;
     }
     
-    // Write INT3 (0xCC) breakpoint
-    BYTE int3 = 0xCC;
-    if (!WriteProcessMemory(g_debugger.hProcess, (LPVOID)(uintptr_t)address,
-                           &int3, 1, &bytesRead)) {
-        fprintf(stderr, "Failed to set breakpoint at 0x%lx\n", address);
-        return FALSE;
+    // Try to get symbol name
+    SYMBOL_INFO* symbol = (SYMBOL_INFO*)calloc(sizeof(SYMBOL_INFO) + 256, 1);
+    if (symbol) {
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        
+        if (SymFromAddr(GetCurrentProcess(), addr, NULL, symbol)) {
+            strncpy(bp->symbol, symbol->Name, sizeof(bp->symbol) - 1);
+        } else {
+            bp->symbol[0] = '\0';
+        }
+        free(symbol);
     }
     
-    // Record breakpoint
-    Breakpoint* bp = &g_debugger.breakpoints[g_debugger.breakpointCount];
-    bp->address = address;
-    bp->enabled = TRUE;
-    bp->hitCount = 0;
-    strcpy(bp->condition, "");
+    // Set breakpoint in process memory
+    if (!set_software_breakpoint(dbg, addr)) {
+        return false;
+    }
     
-    printf("[+] Breakpoint %d set at 0x%lx\n",
-           g_debugger.breakpointCount, address);
-    
-    g_debugger.breakpointCount++;
-    return TRUE;
+    dbg->breakpoint_count++;
+    return true;
 }
 
-/* Remove breakpoint by index */
-BOOL RemoveBreakpoint(int index) {
-    if (index < 0 || index >= g_debugger.breakpointCount) {
-        fprintf(stderr, "Invalid breakpoint index\n");
-        return FALSE;
+bool dbg_remove_breakpoint(Debugger* dbg, int bp_num) {
+    if (bp_num < 1 || bp_num > dbg->breakpoint_count) {
+        printf("Invalid breakpoint number %d\n", bp_num);
+        return false;
     }
     
-    Breakpoint* bp = &g_debugger.breakpoints[index];
-    
-    // Restore original byte (would need to store it)
-    // This is simplified - production version needs byte storage
-    
-    // Remove from array
-    memmove(&g_debugger.breakpoints[index],
-            &g_debugger.breakpoints[index + 1],
-            (g_debugger.breakpointCount - index - 1) * sizeof(Breakpoint));
-    
-    g_debugger.breakpointCount--;
-    printf("[+] Breakpoint %d removed\n", index);
-    
-    return TRUE;
-}
-
-/* Continue execution */
-BOOL ContinueExecution(void) {
-    if (g_debugger.state == DBG_STOPPED) {
-        g_debugger.state = DBG_RUNNING;
-        return TRUE;
-    }
-    return FALSE;
-}
-
-/* Step one instruction */
-BOOL StepInstruction(void) {
-    if (!GetThreadContext()) return FALSE;
-    
-    // Set trap flag (TF) to enable single-step
-    g_debugger.threadContext.EFlags |= 0x100;
-    
-    if (!SetThreadContext()) return FALSE;
-    
-    g_debugger.state = DBG_RUNNING;
-    return TRUE;
-}
-
-/* Get current thread context */
-BOOL GetThreadContext(void) {
-    CONTEXT ctx = {0};
-    ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
-    
-    if (!GetThreadContext(g_debugger.hThread, &ctx)) {
-        fprintf(stderr, "GetThreadContext failed: %lu\n", GetLastError());
-        return FALSE;
+    Breakpoint* bp = &dbg->breakpoints[bp_num - 1];
+    if (!bp->enabled) {
+        printf("Breakpoint %d already disabled\n", bp_num);
+        return false;
     }
     
-    memcpy(&g_debugger.threadContext, &ctx, sizeof(CONTEXT));
-    return TRUE;
-}
-
-/* Set current thread context */
-BOOL SetThreadContext(void) {
-    if (!SetThreadContext(g_debugger.hThread, &g_debugger.threadContext)) {
-        fprintf(stderr, "SetThreadContext failed: %lu\n", GetLastError());
-        return FALSE;
-    }
-    return TRUE;
-}
-
-/* Read memory dump */
-BOOL ReadMemoryDump(DWORD64 address, int size) {
-    SIZE_T bytesRead;
-    
-    if (size > sizeof(g_debugger.memoryDump)) {
-        size = sizeof(g_debugger.memoryDump);
+    // Remove from process memory
+    if (!remove_software_breakpoint(dbg, bp->address, bp->original_byte)) {
+        return false;
     }
     
-    if (!ReadProcessMemory(g_debugger.hProcess, (LPVOID)address,
-                          g_debugger.memoryDump, size, &bytesRead)) {
-        return FALSE;
-    }
-    
-    g_debugger.memoryBase = address;
-    return TRUE;
+    bp->enabled = false;
+    return true;
 }
 
-/* Handle debug events from debuggee */
-void HandleDebugEvent(DEBUG_EVENT* pEvent) {
-    switch (pEvent->dwDebugEventCode) {
+void dbg_update_context(Debugger* dbg) {
+    dbg->ctx.ContextFlags = CONTEXT_FULL;
+    if (!GetThreadContext(dbg->hThread, &dbg->ctx)) {
+        printf("GetThreadContext failed (err=%lu)\n", GetLastError());
+    }
+}
+
+// Private helpers
+static bool handle_debug_event(Debugger* dbg, DEBUG_EVENT* evt) {
+    switch (evt->dwDebugEventCode) {
+        case CREATE_PROCESS_DEBUG_EVENT:
+            // Process created, let it run until first breakpoint
+            dbg_update_context(dbg);
+            return true;
+            
         case EXCEPTION_DEBUG_EVENT: {
-            EXCEPTION_RECORD* pExcept = &pEvent->u.Exception.ExceptionInfo;
+            DWORD exc_code = evt->u.Exception.ExceptionRecord.ExceptionCode;
+            uintptr_t exc_addr = (uintptr_t)evt->u.Exception.ExceptionRecord.ExceptionAddress;
             
-            if (pExcept->ExceptionCode == EXCEPTION_BREAKPOINT) {
-                GetThreadContext();
-                g_debugger.state = DBG_BREAKPOINT;
-                printf("[!] Breakpoint hit at 0x%llx\n",
-                       (unsigned long long)g_debugger.threadContext.Rip);
+            if (exc_code == EXCEPTION_BREAKPOINT) {
+                // Handle software breakpoint
+                bool found = false;
+                for (int i = 0; i < dbg->breakpoint_count; i++) {
+                    Breakpoint* bp = &dbg->breakpoints[i];
+                    if (bp->enabled && bp->address == exc_addr) {
+                        // Decrement EIP/RIP to point to the breakpoint instruction
+                        #if TARGET_X64
+                            dbg->ctx.Rip--;
+                        #else
+                            dbg->ctx.Eip--;
+                        #endif
+                        if (!SetThreadContext(dbg->hThread, &dbg->ctx)) {
+                            printf("SetThreadContext failed (err=%lu)\n", GetLastError());
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+                
+                if (!found) {
+                    // First breakpoint at entry point
+                    dbg_update_context(dbg);
+                }
+                
+                dbg->is_running = false;
+                SuspendThread(dbg->hThread);
+                return true;
             }
-            else if (pExcept->ExceptionCode == EXCEPTION_SINGLE_STEP) {
-                GetThreadContext();
-                g_debugger.state = DBG_STEPPED;
-                printf("[*] Single step at 0x%llx\n",
-                       (unsigned long long)g_debugger.threadContext.Rip);
+            else if (exc_code == EXCEPTION_SINGLE_STEP) {
+                // Single-step completed
+                dbg_update_context(dbg);
+                dbg->is_running = false;
+                SuspendThread(dbg->hThread);
+                return true;
             }
-            else {
-                printf("[!] Exception 0x%lx at 0x%llx\n",
-                       pExcept->ExceptionCode,
-                       (unsigned long long)pExcept->ExceptionAddress);
+            else if (exc_code == EXCEPTION_ACCESS_VIOLATION) {
+                printf("Access violation at 0x%p\n", (void*)exc_addr);
+                dbg->is_running = false;
+                SuspendThread(dbg->hThread);
+                return false;
             }
             break;
         }
         
-        case CREATE_THREAD_DEBUG_EVENT:
-            printf("[*] Thread created: TID=%lu\n", pEvent->dwThreadId);
-            break;
-            
-        case EXIT_THREAD_DEBUG_EVENT:
-            printf("[*] Thread exited: TID=%lu\n", pEvent->dwThreadId);
-            break;
-            
         case EXIT_PROCESS_DEBUG_EVENT:
-            printf("[*] Process exited\n");
-            break;
+            printf("\nProcess exited with code %lu\n", evt->u.ExitProcess.dwExitCode);
+            dbg->exit_debugger = true;
+            dbg->is_running = false;
+            return false;
             
-        case LOAD_DLL_DEBUG_EVENT: {
-            char dllName[MAX_PATH];
-            GetModuleFileNameExA(g_debugger.hProcess,
-                                (HMODULE)pEvent->u.LoadDll.lpBaseOfDll,
-                                dllName, MAX_PATH);
-            printf("[+] DLL loaded: %s\n", dllName);
-            break;
-        }
-        
-        case UNLOAD_DLL_DEBUG_EVENT:
-            printf("[-] DLL unloaded\n");
+        case LOAD_DLL_DEBUG_EVENT:
+            // Load symbols for new DLL
+            if (evt->u.LoadDll.lpBaseOfDll) {
+                SymLoadModule64(GetCurrentProcess(), evt->u.LoadDll.hFile, NULL, NULL, 
+                              (DWORD64)evt->u.LoadDll.lpBaseOfDll, 0);
+            }
             break;
     }
+    
+    return true;
 }
 
-/* Cleanup debugger resources */
-void CleanupDebugger(void) {
-    if (g_debugger.hProcess) {
-        DebugActiveProcessStop(g_debugger.dwProcessId);
-        CloseHandle(g_debugger.hProcess);
+static bool set_software_breakpoint(Debugger* dbg, uintptr_t addr) {
+    BYTE cc = 0xCC; // INT3 instruction
+    SIZE_T written;
+    if (!WriteProcessMemory(dbg->hProcess, (LPVOID)addr, &cc, 1, &written) || written != 1) {
+        printf("Failed to set breakpoint at 0x%p (err=%lu)\n", (void*)addr, GetLastError());
+        return false;
     }
-    
-    if (g_debugger.hThread) {
-        CloseHandle(g_debugger.hThread);
+    return true;
+}
+
+static bool remove_software_breakpoint(Debugger* dbg, uintptr_t addr, BYTE original_byte) {
+    SIZE_T written;
+    if (!WriteProcessMemory(dbg->hProcess, (LPVOID)addr, &original_byte, 1, &written) || written != 1) {
+        printf("Failed to remove breakpoint at 0x%p (err=%lu)\n", (void*)addr, GetLastError());
+        return false;
     }
-    
-    if (g_debugger.hDebugEvent) {
-        CloseHandle(g_debugger.hDebugEvent);
-    }
-    
-    SymCleanup(GetCurrentProcess());
+    return true;
 }

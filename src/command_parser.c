@@ -1,146 +1,150 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <ctype.h>
 #include "debugger.h"
-#include "ui.h"
 
-#define MAX_ARGS 10
+void cmd_execute(Debugger* dbg, const char* cmd) {
+    if (!cmd || !*cmd) return;
+    
+    char command[512];
+    strncpy(command, cmd, sizeof(command) - 1);
+    command[sizeof(command) - 1] = '\0';
+    
+    // Tokenize command
+    char* tokens[16];
+    int token_count = 0;
+    char* token = strtok(command, " \t");
+    
+    while (token && token_count < 16) {
+        tokens[token_count++] = token;
+        token = strtok(NULL, " \t");
+    }
+    
+    if (token_count == 0) return;
+    
+    // Command aliases
+    if (strcmp(tokens[0], "r") == 0 || strcmp(tokens[0], "run") == 0) {
+        dbg->is_running = false; // Ensure we're stopped
+        dbg_run(dbg);
+    }
+    else if (strcmp(tokens[0], "c") == 0 || strcmp(tokens[0], "continue") == 0) {
+        dbg_continue(dbg);
+    }
+    else if (strcmp(tokens[0], "s") == 0 || strcmp(tokens[0], "step") == 0) {
+        dbg_step(dbg);
+    }
+    else if (strcmp(tokens[0], "b") == 0 || strcmp(tokens[0], "break") == 0) {
+        cmd_parse_break(dbg, token_count > 1 ? tokens[1] : NULL);
+    }
+    else if (strcmp(tokens[0], "del") == 0 || strcmp(tokens[0], "delete") == 0) {
+        cmd_parse_delete(dbg, token_count > 1 ? tokens[1] : NULL);
+    }
+    else if (strcmp(tokens[0], "x") == 0 || strcmp(tokens[0], "examine") == 0) {
+        cmd_parse_examine(dbg, token_count > 1 ? tokens[1] : NULL);
+    }
+    else if (strcmp(tokens[0], "info") == 0 && token_count > 1) {
+        cmd_parse_info(dbg, tokens[1]);
+    }
+    else if (strcmp(tokens[0], "q") == 0 || strcmp(tokens[0], "quit") == 0) {
+        dbg->exit_debugger = true;
+    }
+    else {
+        printf("Unknown command: %s\n", tokens[0]);
+    }
+}
 
-typedef struct {
-    char* name;
-    char* shortName;
-    void (*handler)(int argc, char* argv[]);
-    char* description;
-} Command;
-
-/* Command handlers */
-
-void cmd_break(int argc, char* argv[]) {
-    if (argc < 2) {
+void cmd_parse_break(Debugger* dbg, char* args) {
+    if (!args) {
         printf("Usage: break <address>\n");
         return;
     }
     
-    DWORD addr = strtoul(argv[1], NULL, 16);
-    SetBreakpoint(addr);
-}
-
-void cmd_continue(int argc, char* argv[]) {
-    ContinueExecution();
-    printf("[*] Continuing execution...\n");
-}
-
-void cmd_step(int argc, char* argv[]) {
-    StepInstruction();
-    printf("[*] Stepping...\n");
-}
-
-void cmd_info(int argc, char* argv[]) {
-    if (argc < 2) {
-        printf("Usage: info <breakpoints|registers|locals>\n");
-        return;
-    }
-    
-    if (strcmp(argv[1], "breakpoints") == 0) {
-        printf("Breakpoints:\n");
-        for (int i = 0; i < g_debugger.breakpointCount; i++) {
-            printf("[%d] 0x%lx %s (hits: %lu)\n",
-                   i,
-                   g_debugger.breakpoints[i].address,
-                   g_debugger.breakpoints[i].enabled ? "enabled" : "disabled",
-                   g_debugger.breakpoints[i].hitCount);
-        }
-    }
-    else if (strcmp(argv[1], "registers") == 0) {
-        GetThreadContext();
-        printf("RAX=0x%llx RBX=0x%llx RCX=0x%llx RDX=0x%llx\n",
-               (unsigned long long)g_debugger.threadContext.Rax,
-               (unsigned long long)g_debugger.threadContext.Rbx,
-               (unsigned long long)g_debugger.threadContext.Rcx,
-               (unsigned long long)g_debugger.threadContext.Rdx);
-    }
-}
-
-void cmd_examine(int argc, char* argv[]) {
-    if (argc < 2) {
-        printf("Usage: examine <address> [size]\n");
-        return;
-    }
-    
-    DWORD64 addr = strtoull(argv[1], NULL, 16);
-    int size = (argc > 2) ? atoi(argv[2]) : 64;
-    
-    ReadMemoryDump(addr, size);
-    
-    for (int i = 0; i < size; i += 16) {
-        printf("0x%llx: ", (unsigned long long)(addr + i));
-        for (int j = 0; j < 16 && (i + j) < size; j++) {
-            printf("%02x ", g_debugger.memoryDump[i + j]);
-        }
-        printf("\n");
-    }
-}
-
-void cmd_help(int argc, char* argv[]) {
-    printf("Available Commands:\n");
-    printf("  break/b <addr>         - Set breakpoint at address\n");
-    printf("  delete <bp>            - Delete breakpoint\n");
-    printf("  continue/c             - Continue execution\n");
-    printf("  step/s                 - Step one instruction\n");
-    printf("  info <type>            - Show information\n");
-    printf("  examine/x <addr>       - Examine memory\n");
-    printf("  print/p <expr>         - Print expression\n");
-    printf("  quit/q                 - Exit debugger\n");
-}
-
-void cmd_quit(int argc, char* argv[]) {
-    printf("Exiting debugger...\n");
-    exit(0);
-}
-
-/* Command table */
-Command commands[] = {
-    {"break", "b", cmd_break, "Set breakpoint"},
-    {"continue", "c", cmd_continue, "Continue execution"},
-    {"step", "s", cmd_step, "Step instruction"},
-    {"info", "i", cmd_info, "Show information"},
-    {"examine", "x", cmd_examine, "Examine memory"},
-    {"help", "h", cmd_help, "Show help"},
-    {"quit", "q", cmd_quit, "Exit debugger"},
-    {NULL, NULL, NULL, NULL}
-};
-
-/* Parse and execute command */
-void ParseCommand(const char* cmdLine) {
-    char* buffer = malloc(strlen(cmdLine) + 1);
-    strcpy(buffer, cmdLine);
-    
-    char* argv[MAX_ARGS];
-    int argc = 0;
-    
-    // Tokenize
-    char* token = strtok(buffer, " ");
-    while (token && argc < MAX_ARGS) {
-        argv[argc++] = token;
-        token = strtok(NULL, " ");
-    }
-    
-    if (argc == 0) {
-        free(buffer);
-        return;
-    }
-    
-    // Find and execute command
-    for (int i = 0; commands[i].name; i++) {
-        if (strcmp(argv[0], commands[i].name) == 0 ||
-            strcmp(argv[0], commands[i].shortName) == 0) {
-            commands[i].handler(argc, argv);
-            free(buffer);
+    // Try to parse as hex address
+    uintptr_t addr = 0;
+    if (sscanf(args, "%llx", &addr) != 1) {
+        // Try symbol resolution
+        SYMBOL_INFO* symbol = (SYMBOL_INFO*)calloc(sizeof(SYMBOL_INFO) + 256, 1);
+        if (!symbol) {
+            printf("Memory allocation failed\n");
             return;
         }
+        
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        
+        if (SymFromName(GetCurrentProcess(), args, symbol)) {
+            addr = (uintptr_t)symbol->Address;
+            printf("Breakpoint at symbol '%s' (0x%p)\n", args, (void*)addr);
+        } else {
+            printf("Unknown symbol or invalid address: %s (err=%lu)\n", args, GetLastError());
+            free(symbol);
+            return;
+        }
+        free(symbol);
     }
     
-    printf("Unknown command: %s\n", argv[0]);
-    free(buffer);
+    if (dbg_set_breakpoint(dbg, addr)) {
+        printf("Breakpoint set at 0x%p\n", (void*)addr);
+    }
+}
+
+void cmd_parse_delete(Debugger* dbg, char* args) {
+    if (!args) {
+        printf("Usage: delete <breakpoint-number>\n");
+        return;
+    }
+    
+    int bp_num = atoi(args);
+    if (bp_num <= 0) {
+        printf("Invalid breakpoint number\n");
+        return;
+    }
+    
+    if (dbg_remove_breakpoint(dbg, bp_num)) {
+        printf("Breakpoint %d deleted\n", bp_num);
+    }
+}
+
+void cmd_parse_examine(Debugger* dbg, char* args) {
+    if (!args) {
+        printf("Usage: x <address>\n");
+        return;
+    }
+    
+    uintptr_t addr = 0;
+    if (sscanf(args, "%llx", &addr) != 1) {
+        printf("Invalid address\n");
+        return;
+    }
+    
+    dbg->memory_base = addr;
+    printf("Memory view set to 0x%p\n", (void*)addr);
+}
+
+void cmd_parse_info(Debugger* dbg, char* subcmd) {
+    if (!subcmd) return;
+    
+    if (strcmp(subcmd, "registers") == 0 || strcmp(subcmd, "r") == 0) {
+        // Registers already visible in UI panel
+        dbg_update_context(dbg);
+        printf("Registers updated\n");
+    }
+    else if (strcmp(subcmd, "breakpoints") == 0 || strcmp(subcmd, "b") == 0) {
+        if (dbg->breakpoint_count == 0) {
+            printf("No breakpoints set.\n");
+            return;
+        }
+        
+        printf("Num\tType\tDisp\tEnb\tAddress\t\t\tWhat\n");
+        for (int i = 0; i < dbg->breakpoint_count; i++) {
+            Breakpoint* bp = &dbg->breakpoints[i];
+            if (!bp->enabled) continue;
+            
+            printf("%d\tbreakpoint\tkeep\t%s\t0x%016llx\t%s\n",
+                i + 1,
+                bp->enabled ? "y" : "n",
+                (unsigned long long)bp->address,
+                bp->symbol[0] ? bp->symbol : "<no symbol>");
+        }
+    }
+    else {
+        printf("Unknown info subcommand: %s\n", subcmd);
+    }
 }
