@@ -1,6 +1,6 @@
-# Windows TUI Debugger
+# 6rdbg - Cross-Platform TUI Debugger
 
-A GDB-inspired interactive debugger for Windows with real-time visual feedback.
+A GDB-inspired interactive debugger for Windows and Linux with real-time visual feedback.
 
 ## Features
 
@@ -14,24 +14,54 @@ A GDB-inspired interactive debugger for Windows with real-time visual feedback.
 ## Building
 
 ### Requirements
+
+#### Windows
 - Windows 10 or later
 - MinGW or Visual Studio
 - Debug Help Library (dbghelp.lib)
 
-### Compilation
+#### Linux
+- GCC or Clang
+- ncursesw library
+- ptrace support
+- libpthread
 
-Using MinGW:
+### Cross-Platform Build with CMake
+
 ```bash
-gcc -o debugger.exe main.c debugger.c ui.c command_parser.c -ldbghelp -lpsapi -lws2_32
+mkdir build
+cd build
+cmake ..
+make
 ```
-Using Visual Studio:
+
+### Platform-Specific Builds
+
+#### Windows (MinGW):
+```bash
+gcc -o 6rdbg.exe main.c debugger_platform.c ui_platform.c ui_common.c disasm.c command_parser.c -ldbghelp -lpsapi
 ```
-cl main.c debugger.c ui.c command_parser.c dbghelp.lib psapi.lib ws2_32.lib
+
+#### Linux:
+```bash
+gcc -o 6rdbg main.c debugger_platform.c ui_platform.c ui_common.c disasm.c command_parser.c -lncursesw -lpthread
 ```
 
 ## Usage
+
+### Windows
 ```
 6rdbg.exe C:\path\to\executable.exe
+```
+
+### Linux
+```
+./6rdbg /path/to/executable
+```
+
+Note: On Linux, you may need to run with appropriate permissions for ptrace:
+```
+./6rdbg /path/to/executable
 ```
 
 ## Commands

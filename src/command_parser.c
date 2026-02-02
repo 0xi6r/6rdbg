@@ -30,6 +30,12 @@ void cmd_execute(Debugger* dbg, const char* cmd) {
     else if (strcmp(tokens[0], "s") == 0 || strcmp(tokens[0], "step") == 0) {
         dbg_step(dbg);
     }
+    else if (strcmp(tokens[0], "n") == 0 || strcmp(tokens[0], "next") == 0) {
+        dbg_step_over(dbg);
+    }
+    else if (strcmp(tokens[0], "fin") == 0 || strcmp(tokens[0], "finish") == 0) {
+        dbg_finish(dbg);
+    }
     else if (strcmp(tokens[0], "b") == 0 || strcmp(tokens[0], "break") == 0) {
         cmd_parse_break(dbg, token_count > 1 ? tokens[1] : NULL);
     }
@@ -58,8 +64,9 @@ void cmd_parse_break(Debugger* dbg, char* args) {
     
     // Try to parse as hex address
     uintptr_t addr = 0;
-    if (sscanf(args, "%llx", &addr) != 1) {
-        // Try symbol resolution
+    if (sscanf(args, "%lx", &addr) != 1) {
+        #if PLATFORM_WINDOWS
+        // Try symbol resolution (Windows only)
         SYMBOL_INFO* symbol = (SYMBOL_INFO*)calloc(sizeof(SYMBOL_INFO) + 256, 1);
         if (!symbol) {
             printf("Memory allocation failed\n");
@@ -78,6 +85,11 @@ void cmd_parse_break(Debugger* dbg, char* args) {
             return;
         }
         free(symbol);
+        #else
+        // Linux: symbol resolution not implemented yet
+        printf("Symbol resolution not implemented on this platform. Use hex addresses.\n");
+        return;
+        #endif
     }
     
     if (dbg_set_breakpoint(dbg, addr)) {
@@ -109,7 +121,7 @@ void cmd_parse_examine(Debugger* dbg, char* args) {
     }
     
     uintptr_t addr = 0;
-    if (sscanf(args, "%llx", &addr) != 1) {
+    if (sscanf(args, "%lx", &addr) != 1) {
         printf("Invalid address\n");
         return;
     }

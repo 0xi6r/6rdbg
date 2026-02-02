@@ -1,10 +1,11 @@
+#include "platform.h"
 #include "debugger.h"
 
 // Simplified disassembler for common instructions
-size_t disasm_instruction(BYTE* code, size_t max_size, uintptr_t address, Instruction* instr) {
+size_t disasm_instruction(byte* code, size_t max_size, uintptr_t address, Instruction* instr) {
     if (max_size == 0 || !code || !instr) return 0;
     
-    ZeroMemory(instr, sizeof(Instruction));
+    memset(instr, 0, sizeof(Instruction));
     
     // Handle common prefixes
     size_t offset = 0;
@@ -20,7 +21,7 @@ size_t disasm_instruction(BYTE* code, size_t max_size, uintptr_t address, Instru
     
     // Now decode opcode
     if (offset >= max_size) return 0;
-    BYTE opcode = code[offset];
+    byte opcode = code[offset];
     offset++;
     
     if (offset > max_size) return 0;
@@ -73,7 +74,7 @@ size_t disasm_instruction(BYTE* code, size_t max_size, uintptr_t address, Instru
     }
     else if (opcode == 0x0F && offset < max_size) {
         // Two-byte opcode
-        BYTE opcode2 = code[offset];
+        byte opcode2 = code[offset];
         offset++;
         
         if ((opcode2 & 0xF0) == 0x80 && offset + 4 <= max_size) { // Jcc rel32
@@ -91,18 +92,19 @@ size_t disasm_instruction(BYTE* code, size_t max_size, uintptr_t address, Instru
         }
     }
     
-    // MOV examples (register immediate)
-    if ((opcode & 0xC0) == 0xB0) { // MOV r8, imm8 (0xB0-0xB7)
+    // MOV r8, imm8 (0xB0-0xB7)
+    if (opcode >= 0xB0 && opcode <= 0xB7) {
         if (offset + 1 > max_size) return 0;
-        BYTE imm = code[offset];
+        byte imm = code[offset];
         int reg = opcode & 0x07;
-        const char* reg_name = get_register_name(reg, TARGET_X64 && rex_w);
+        const char* reg_name = get_register_name(reg, false);
         snprintf(instr->mnemonic, sizeof(instr->mnemonic), "mov");
         snprintf(instr->operands, sizeof(instr->operands), "%s, 0x%02X", reg_name, imm);
         instr->size = offset + 1;
         return instr->size;
     }
-    else if ((opcode & 0xC8) == 0xB8) { // MOV r16/r32/r64, imm16/32/64
+    // MOV r16/r32/r64, imm16/32/64 (0xB8-0xBF)
+    else if (opcode >= 0xB8 && opcode <= 0xBF) {
         int width = 4; // default 32-bit
         #if TARGET_X64
         if (rex_w) width = 8;
@@ -114,16 +116,46 @@ size_t disasm_instruction(BYTE* code, size_t max_size, uintptr_t address, Instru
         const char* reg_name = get_register_name(reg, TARGET_X64 && rex_w);
         
         if (width == 8) {
-            uint64_t imm = *(uint64_t*)&code[offset];
+            uint64_t immediate = *(uint64_t*)&code[offset];
             snprintf(instr->mnemonic, sizeof(instr->mnemonic), "mov");
-            snprintf(instr->operands, sizeof(instr->operands), "%s, 0x%llx", reg_name, imm);
+            snprintf(instr->operands, sizeof(instr->operands), "%s, 0x%lx", reg_name, (unsigned long)immediate);
         } else {
-            uint32_t imm = *(uint32_t*)&code[offset];
+            uint32_t immediate = *(uint32_t*)&code[offset];
             snprintf(instr->mnemonic, sizeof(instr->mnemonic), "mov");
-            snprintf(instr->operands, sizeof(instr->operands), "%s, 0x%X", reg_name, imm);
+            snprintf(instr->operands, sizeof(instr->operands), "%s, 0x%X", reg_name, immediate);
         }
         
         instr->size = offset + width;
+        return instr->size;
+    }
+    // ADD r/m32, imm32 (0x81 /0)
+    else if (opcode == 0x81 && offset + 6 <= max_size) {
+        byte modrm = code[offset];
+        int reg = (modrm >> 3) & 0x07;
+        if (reg == 0) { // ADD
+            snprintf(instr->mnemonic, sizeof(instr->mnemonic), "add");
+            uint32_t immediate = *(uint32_t*)&code[offset + 1];
+            snprintf(instr->operands, sizeof(instr->operands), "[reg], 0x%X", immediate);
+            instr->size = offset + 6;
+            return instr->size;
+        }
+    }
+    // PUSH reg (0x50-0x57)
+    else if (opcode >= 0x50 && opcode <= 0x57) {
+        int reg = opcode & 0x07;
+        const char* reg_name = get_register_name(reg, TARGET_X64);
+        snprintf(instr->mnemonic, sizeof(instr->mnemonic), "push");
+        snprintf(instr->operands, sizeof(instr->operands), "%s", reg_name);
+        instr->size = offset;
+        return instr->size;
+    }
+    // POP reg (0x58-0x5F)
+    else if (opcode >= 0x58 && opcode <= 0x5F) {
+        int reg = opcode & 0x07;
+        const char* reg_name = get_register_name(reg, TARGET_X64);
+        snprintf(instr->mnemonic, sizeof(instr->mnemonic), "pop");
+        snprintf(instr->operands, sizeof(instr->operands), "%s", reg_name);
+        instr->size = offset;
         return instr->size;
     }
     

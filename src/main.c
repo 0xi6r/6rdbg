@@ -1,3 +1,4 @@
+#include "platform.h"
 #include "debugger.h"
 
 int main(int argc, char* argv[]) {
@@ -8,23 +9,29 @@ int main(int argc, char* argv[]) {
 
     Debugger dbg = {0};
     
-    // Initialize symbol handler
+    #if PLATFORM_WINDOWS
+    // Initialize symbol handler (Windows only)
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
     if (!SymInitialize(GetCurrentProcess(), NULL, TRUE)) {
         printf("Failed to initialize symbol handler (err=%lu)\n", GetLastError());
         return 1;
     }
+    #endif
 
     // Initialize debugger
     if (!dbg_initialize(&dbg, argv[1])) {
+        #if PLATFORM_WINDOWS
         SymCleanup(GetCurrentProcess());
+        #endif
         return 1;
     }
 
     // Initialize UI
     if (!ui_initialize(&dbg)) {
         dbg_cleanup(&dbg);
+        #if PLATFORM_WINDOWS
         SymCleanup(GetCurrentProcess());
+        #endif
         return 1;
     }
 
@@ -42,7 +49,9 @@ int main(int argc, char* argv[]) {
     // Cleanup
     ui_cleanup(&dbg);
     dbg_cleanup(&dbg);
+    #if PLATFORM_WINDOWS
     SymCleanup(GetCurrentProcess());
+    #endif
     
     return 0;
 }
